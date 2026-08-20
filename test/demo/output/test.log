@@ -1,0 +1,6 @@
+[2026-08-20 09:28:56,441] - [trainer.py file line:48] - INFO: load_model_path: ./TTSR.pt
+[2026-08-20 09:28:56,502] - [trainer.py file line:163] - INFO: Test process...
+[2026-08-20 09:28:56,502] - [trainer.py file line:164] - INFO: lr path:     ./test/demo/lr/0.png
+[2026-08-20 09:28:56,502] - [trainer.py file line:165] - INFO: ref path:    ./test/demo/ref/0.png
+[2026-08-20 09:28:57,085] - [trainer.py file line:205] - INFO: output path: ./test/demo/output/save_results/0.png
+[2026-08-20 09:28:57,086] - [trainer.py file line:207] - INFO: Test over.
