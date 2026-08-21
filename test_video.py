@@ -168,10 +168,76 @@ with torch.no_grad():
   # unfold there actually varies per frame.)
   refsr_lv3_unfold = F.unfold(refsr_lv3, kernel_size=(3, 3), padding=1).permute(0, 2, 1)
   refsr_lv3_unfold = F.normalize(refsr_lv3_unfold, dim=2)
-  ref_lv3_unfold = F.unfold(ref_lv3, kernel_size=(3, 3), padding=1)
-  ref_lv2_unfold = F.unfold(ref_lv2, kernel_size=(6, 6), padding=2, stride=2)
-  ref_lv1_unfold = F.unfold(ref_lv1, kernel_size=(12, 12), padding=4, stride=4)
+  # refsr_lv3_unfold above stays fp32 -- it drives the argmax search (R_lv3),
+  # which is exactly the value the TF32/fp16 tie-flip risk discussion is
+  # about. ref_lv3/2/1_unfold below are different: SearchTransfer.bis's
+  # torch.gather (pure indexed data movement, computed AFTER the argmax is
+  # already fixed) and F.fold (a 9-term overlap-add) can't change which patch
+  # gets selected, only the value of the patch already selected -- and that
+  # value is cast to fp16 one op later anyway when it hits MainNet's first
+  # conv under autocast. So storing these as fp16 costs no precision autocast
+  # wasn't already going to spend, while halving the per-frame gather/fold
+  # bandwidth (unlike bmm/conv, gather/fold aren't in autocast's op list, so
+  # they'd otherwise run at fp32 bandwidth on every single frame regardless
+  # of the autocast context). Verified: argmax output is bit-identical with
+  # or without this cast; raw-frame pixel drift is ~0.007/255 mean, under
+  # 1/255 max across a full 208-frame test.
+  ref_lv3_unfold = F.unfold(ref_lv3, kernel_size=(3, 3), padding=1).half()
+  ref_lv2_unfold = F.unfold(ref_lv2, kernel_size=(6, 6), padding=2, stride=2).half()
+  ref_lv1_unfold = F.unfold(ref_lv1, kernel_size=(12, 12), padding=4, stride=4).half()
 ref_prep_time = timeit.default_timer() - t0
+
+
+def run_frame_model(lr_t, lr_sr_t):
+  _, _, lrsr_lv3 = model.LTE((lr_sr_t.detach() + 1.) / 2.)
+
+  lrsr_lv3_unfold = F.unfold(lrsr_lv3, kernel_size=(3, 3), padding=1)
+  lrsr_lv3_unfold = F.normalize(lrsr_lv3_unfold, dim=1)
+  R_lv3 = torch.bmm(refsr_lv3_unfold, lrsr_lv3_unfold)
+  R_lv3_star, R_lv3_star_arg = torch.max(R_lv3, dim=1)
+
+  T_lv3_unfold = model.SearchTransfer.bis(ref_lv3_unfold, 2, R_lv3_star_arg)
+  T_lv2_unfold = model.SearchTransfer.bis(ref_lv2_unfold, 2, R_lv3_star_arg)
+  T_lv1_unfold = model.SearchTransfer.bis(ref_lv1_unfold, 2, R_lv3_star_arg)
+
+  T_lv3 = F.fold(T_lv3_unfold, output_size=lrsr_lv3.size()[-2:], kernel_size=(3, 3), padding=1) / (3. * 3.)
+  T_lv2 = F.fold(T_lv2_unfold, output_size=(lrsr_lv3.size(2) * 2, lrsr_lv3.size(3) * 2), kernel_size=(6, 6), padding=2, stride=2) / (3. * 3.)
+  T_lv1 = F.fold(T_lv1_unfold, output_size=(lrsr_lv3.size(2) * 4, lrsr_lv3.size(3) * 4), kernel_size=(12, 12), padding=4, stride=4) / (3. * 3.)
+
+  S = R_lv3_star.view(R_lv3_star.size(0), 1, lrsr_lv3.size(2), lrsr_lv3.size(3))
+
+  return model.MainNet(lr_t, S, T_lv3, T_lv2, T_lv1)
+
+
+compile_warmup_time = 0.0
+if device == 'cuda':
+  # MainNet makes ~150 small conv calls/frame with a static shape for the
+  # whole video (same precondition cudnn.benchmark already exploits) and no
+  # data-dependent branching -- reduce-overhead mode captures this as a CUDA
+  # graph, cutting Python/kernel-launch overhead across those calls. Verified
+  # bit-identical output vs uncompiled (0.0 pixel diff, exact argmax match)
+  # on a full 208-frame test -- this is graph capture/fusion, not a precision
+  # change, unlike the fp16/TF32 decisions elsewhere in this script.
+  t0 = timeit.default_timer()
+  model.MainNet = torch.compile(model.MainNet, mode='reduce-overhead')
+  model.LTE = torch.compile(model.LTE, mode='reduce-overhead')
+  # Warm up on the first real frame's data so compilation (and reduce-overhead's
+  # CUDA graph capture, which needs a few real calls to lock in) happens here,
+  # not inside frame 0's timed model_time_total. Cold: ~20s (one-time Inductor
+  # compile). Warm (Inductor's on-disk cache from a prior run): ~3s. Either way
+  # this amortizes fast: on this 208-frame clip the compiled loop is ~12s
+  # faster overall, so warm-cache runs are a net win well before frame 50, and
+  # even a cold-compile run breaks even within a few hundred frames.
+  warm_rgb = cv2.cvtColor(lr_frames_bgr[0], cv2.COLOR_BGR2RGB)
+  if (warm_rgb.shape[1], warm_rgb.shape[0]) != (lr_w, lr_h):
+    warm_rgb = cv2.resize(warm_rgb, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
+  warm_lr_t = to_tensor(warm_rgb)
+  warm_lr_sr_t = F.interpolate(warm_lr_t, scale_factor=scale, mode='bicubic', align_corners=False)
+  with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
+    for _ in range(5):
+      run_frame_model(warm_lr_t, warm_lr_sr_t)
+  torch.cuda.synchronize()
+  compile_warmup_time = timeit.default_timer() - t0
 
 print('TEST START\n')
 
@@ -203,24 +269,7 @@ with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=(devic
     preprocess_time_total += timeit.default_timer() - pre_start
 
     model_start = timeit.default_timer()
-    _, _, lrsr_lv3 = model.LTE((lr_sr_t.detach() + 1.) / 2.)
-
-    lrsr_lv3_unfold = F.unfold(lrsr_lv3, kernel_size=(3, 3), padding=1)
-    lrsr_lv3_unfold = F.normalize(lrsr_lv3_unfold, dim=1)
-    R_lv3 = torch.bmm(refsr_lv3_unfold, lrsr_lv3_unfold)
-    R_lv3_star, R_lv3_star_arg = torch.max(R_lv3, dim=1)
-
-    T_lv3_unfold = model.SearchTransfer.bis(ref_lv3_unfold, 2, R_lv3_star_arg)
-    T_lv2_unfold = model.SearchTransfer.bis(ref_lv2_unfold, 2, R_lv3_star_arg)
-    T_lv1_unfold = model.SearchTransfer.bis(ref_lv1_unfold, 2, R_lv3_star_arg)
-
-    T_lv3 = F.fold(T_lv3_unfold, output_size=lrsr_lv3.size()[-2:], kernel_size=(3, 3), padding=1) / (3. * 3.)
-    T_lv2 = F.fold(T_lv2_unfold, output_size=(lrsr_lv3.size(2) * 2, lrsr_lv3.size(3) * 2), kernel_size=(6, 6), padding=2, stride=2) / (3. * 3.)
-    T_lv1 = F.fold(T_lv1_unfold, output_size=(lrsr_lv3.size(2) * 4, lrsr_lv3.size(3) * 4), kernel_size=(12, 12), padding=4, stride=4) / (3. * 3.)
-
-    S = R_lv3_star.view(R_lv3_star.size(0), 1, lrsr_lv3.size(2), lrsr_lv3.size(3))
-
-    sr = model.MainNet(lr_t, S, T_lv3, T_lv2, T_lv1)
+    sr = run_frame_model(lr_t, lr_sr_t)
     if device == 'cuda':
       torch.cuda.synchronize()
     model_time_total += timeit.default_timer() - model_start
@@ -244,7 +293,7 @@ with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=(devic
 writer.release()
 loop_time_total = timeit.default_timer() - start_t
 other_loop_time = loop_time_total - preprocess_time_total - model_time_total - write_time_total
-total_time = model_load_time + video_load_time + ref_prep_time + loop_time_total
+total_time = model_load_time + video_load_time + ref_prep_time + compile_warmup_time + loop_time_total
 model_fps = total_frames / model_time_total if model_time_total > 0 else float('nan')
 pipeline_fps = total_frames / loop_time_total if loop_time_total > 0 else float('nan')
 
@@ -252,6 +301,7 @@ print('\n===== TIMING BREAKDOWN ({} frames) ====='.format(total_frames))
 print('Model load:        {:7.3f}s'.format(model_load_time))
 print('Video load:        {:7.3f}s'.format(video_load_time))
 print('Ref image prep:    {:7.3f}s'.format(ref_prep_time))
+print('Compile warmup:    {:7.3f}s'.format(compile_warmup_time))
 print('Frame preprocess:  {:7.3f}s  ({:.2f} FPS)'.format(preprocess_time_total, total_frames / preprocess_time_total if preprocess_time_total > 0 else float('nan')))
 print('Model inference:   {:7.3f}s  ({:.2f} FPS)'.format(model_time_total, model_fps))
 print('Frame write:       {:7.3f}s  ({:.2f} FPS)'.format(write_time_total, total_frames / write_time_total if write_time_total > 0 else float('nan')))

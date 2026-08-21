@@ -300,6 +300,94 @@ correct) resampling implementation feeding the search.
 6.06 FPS, within noise) since this stage doesn't touch it. End-to-end pipeline: 4.68
 → **5.28 FPS**.
 
+### 9. Cast `ref_lv1_unfold`/`ref_lv2_unfold`/`ref_lv3_unfold` to fp16 storage
+
+**Change:** the three precomputed ref-side tensors consumed by
+`SearchTransfer.bis` (`torch.gather`) and `F.fold` are cast to `.half()` right
+after being computed (once, in the ref-prep block). `refsr_lv3_unfold` — the
+tensor that actually drives the argmax correlation — is deliberately left fp32.
+
+**Why:** `gather` and `fold` aren't in autocast's op list, so despite the whole
+per-frame loop being wrapped in fp16 autocast (step 6), these two ops were still
+running at fp32 memory bandwidth on every single frame. A fresh per-stage
+profiling pass (needed because the pre-fp16 "40% SearchTransfer" figure no
+longer reflects reality once `bmm` got autocast-accelerated) found this
+gather+fold step — called "transfer" below — had grown to be a *bigger* share of
+per-frame time than the correlation search itself:
+
+| Stage | Share of per-frame time (post-fp16, pre-this-change) |
+|---|---|
+| `LTE(lrsr)` | 4.5% |
+| Search (`unfold`/`normalize`/`bmm`/`max`) | 10.8% |
+| Transfer (`bis` gather x3 + `fold` x3) | **22.2%** |
+| `MainNet` | 62.4% |
+
+This is safe in a way the TF32/bf16 rejections above are not: the argmax index
+(`R_lv3_star_arg`) is fully computed *before* these three tensors are touched, so
+casting them can't flip which reference patch gets selected — only the value of
+the patch already selected, and that value becomes fp16 one op later regardless
+once it hits `MainNet`'s first conv under autocast. This also removes a hidden
+cost: today `torch.cat((x11_res[fp16], T_lv3[fp32]))` forces autocast to
+upcast-then-immediately-downcast around all three `cat` calls in
+`MainNet.forward()`; matching dtypes removes that round-trip too.
+
+**Verified:** `R_lv3_star_arg` bit-identical with vs. without the cast across a
+full 208-frame test (`torch.equal` `True`, as expected from the reasoning above).
+Raw-frame pixel diff vs. the pre-change fp16 baseline: mean **0.007/255**, max
+**under 1/255** across all 208 frames — smaller than the fp16-vs-fp32 change
+itself.
+
+**Measured effect:** transfer stage 22.2% → 20.5% of per-frame time (7.43s →
+6.54s over 208 frames, isolated). Real script: model inference 6.06 → 6.32 FPS,
+end-to-end 5.28 → 5.48 FPS.
+
+### 10. `torch.compile(mode="reduce-overhead")` on `MainNet` and `LTE`
+
+**Change:** `model.MainNet`/`model.LTE` wrapped in `torch.compile(mode=
+"reduce-overhead")` once at startup (after ref-prep, so the fp32 ref-feature
+calls stay eager and only the fp16 per-frame path gets compiled), with a 5-call
+warm-up on real frame-0 data before the timed loop starts so compilation cost
+doesn't pollute steady-state FPS. The per-frame model computation (`LTE` →
+search → transfer → `MainNet`) was factored into a `run_frame_model()` function
+so both the warm-up and the main loop call the identical code path.
+
+**Why:** `MainNet.forward()` has zero data-dependent branching — every conv/
+`PixelShuffle`/`F.interpolate` call sees a static shape for the whole video
+(same precondition `cudnn.benchmark` exploits) across ~150 small conv calls per
+frame. That's exactly what `reduce-overhead`'s CUDA-graph capture targets:
+eliminating Python dispatch/kernel-launch overhead across those calls, plus
+Inductor fusing adjacent pointwise ops (`F.relu` after nearly every conv,
+`ResBlock`'s `out * res_scale + x1`). `LTE` is a smaller static VGG slice,
+smaller upside but free to include.
+
+**Verified bit-exact:** compiled vs. uncompiled output on the same 208-frame
+test — `R_lv3_star_arg` exactly equal, raw-frame pixel diff **0.0** (not just
+small — identical). This is CUDA-graph capture/kernel fusion, not a precision
+change, unlike every fp16/TF32 decision elsewhere in this document.
+
+**Compile cost, measured both ways:** cold (first ever compile for this
+model/shape): ~22s one-time. Warm (Inductor's on-disk cache from a prior run
+with the same model/shapes): ~3s. Either amortizes fast — the compiled loop is
+~12s faster than uncompiled over these 208 frames, so a warm-cache run is a net
+win almost immediately, and even a cold-compile run breaks even well within a
+single video.
+
+**Measured effect:** MainNet stage 20.3s → 9.1s (2.23x), LTE stage 1.5s → 0.8s
+(1.87x), isolated wall loop 6.28 → 9.81 FPS. Real script, on top of step 9:
+model inference 6.32 → **10.37 FPS**, end-to-end 5.48 → **8.36 FPS**.
+
+### 11. Re-tested `channels_last` on `MainNet` with fp16 active — still rejected
+
+Re-ran the original `channels_last` experiment (see "What was tried and
+rejected" below) now that fp16 autocast is active, since fp16 tensor cores
+prefer NHWC more strongly than fp32 does. Isolated `MainNet`-only timing:
+**9.84 FPS (contiguous) vs. 7.35 FPS (channels_last)** — channels_last is still
+~34% slower, the same ratio as the original fp32-era measurement (0.170s vs
+0.228s/frame was also ~1.34x). Confirms the original hypothesis that the
+regression's actual cause is `MainNet` interleaving convs with `PixelShuffle`
+and `F.interpolate(bicubic)` (neither has an NHWC-optimized fast path), not the
+dtype. Not applied.
+
 ### Summary (this section's clip, `shourya_bunty_2.mp4`)
 
 | State | Model FPS | End-to-end FPS |
@@ -307,10 +395,13 @@ correct) resampling implementation feeding the search.
 | fp32, `cudnn.benchmark` on, TF32 off (isolated) | 2.50 | — |
 | + fp16 autocast on per-frame loop (step 6) | 6.04 | 4.65 |
 | + `LTE_copy` removed (step 7) | 6.04 | 4.68 |
-| + GPU-side resize (step 8, current) | 6.06 | **5.28** |
+| + GPU-side resize (step 8) | 6.06 | 5.28 |
+| + fp16 ref-unfold storage (step 9) | 6.32 | 5.48 |
+| + `torch.compile` reduce-overhead (step 10, current) | **10.37** | **8.36** |
 
-Net: **~2.4x model inference**, **~1.13x further end-to-end** from step 8 alone on
-top of step 6/7's gain.
+Net across steps 6-10: **~4.1x model inference**, **~1.79x end-to-end** on top
+of whatever steps 1-4 already bought on `ananya.mp4`. `channels_last` (step 11)
+tested and rejected again, no change.
 
 ## What was tried and rejected
 
