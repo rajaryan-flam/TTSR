@@ -6,6 +6,7 @@ import argparse
 import sys
 import timeit
 import cv2
+import torch.nn.functional as F
 from PIL import Image
 
 # option.py parses sys.argv at import time with its own argparse parser,
@@ -140,6 +141,17 @@ ref_sr_t = to_tensor(ref_sr)
 with torch.no_grad():
   ref_lv1, ref_lv2, ref_lv3 = model.LTE((ref_t.detach() + 1.) / 2.)
   _, _, refsr_lv3 = model.LTE((ref_sr_t.detach() + 1.) / 2.)
+
+  # SearchTransfer.forward() also unfolds/normalizes the ref-side tensors
+  # (refsr_lv3, ref_lv1, ref_lv2, ref_lv3) on every call, but those only
+  # depend on the ref features cached above -- precompute them once too.
+  # (Mirrors model/SearchTransfer.py's forward() exactly; only the lrsr-side
+  # unfold there actually varies per frame.)
+  refsr_lv3_unfold = F.unfold(refsr_lv3, kernel_size=(3, 3), padding=1).permute(0, 2, 1)
+  refsr_lv3_unfold = F.normalize(refsr_lv3_unfold, dim=2)
+  ref_lv3_unfold = F.unfold(ref_lv3, kernel_size=(3, 3), padding=1)
+  ref_lv2_unfold = F.unfold(ref_lv2, kernel_size=(6, 6), padding=2, stride=2)
+  ref_lv1_unfold = F.unfold(ref_lv1, kernel_size=(12, 12), padding=4, stride=4)
 ref_prep_time = timeit.default_timer() - t0
 
 print('TEST START\n')
@@ -165,7 +177,22 @@ with torch.no_grad():
 
     model_start = timeit.default_timer()
     _, _, lrsr_lv3 = model.LTE((lr_sr_t.detach() + 1.) / 2.)
-    S, T_lv3, T_lv2, T_lv1 = model.SearchTransfer(lrsr_lv3, refsr_lv3, ref_lv1, ref_lv2, ref_lv3)
+
+    lrsr_lv3_unfold = F.unfold(lrsr_lv3, kernel_size=(3, 3), padding=1)
+    lrsr_lv3_unfold = F.normalize(lrsr_lv3_unfold, dim=1)
+    R_lv3 = torch.bmm(refsr_lv3_unfold, lrsr_lv3_unfold)
+    R_lv3_star, R_lv3_star_arg = torch.max(R_lv3, dim=1)
+
+    T_lv3_unfold = model.SearchTransfer.bis(ref_lv3_unfold, 2, R_lv3_star_arg)
+    T_lv2_unfold = model.SearchTransfer.bis(ref_lv2_unfold, 2, R_lv3_star_arg)
+    T_lv1_unfold = model.SearchTransfer.bis(ref_lv1_unfold, 2, R_lv3_star_arg)
+
+    T_lv3 = F.fold(T_lv3_unfold, output_size=lrsr_lv3.size()[-2:], kernel_size=(3, 3), padding=1) / (3. * 3.)
+    T_lv2 = F.fold(T_lv2_unfold, output_size=(lrsr_lv3.size(2) * 2, lrsr_lv3.size(3) * 2), kernel_size=(6, 6), padding=2, stride=2) / (3. * 3.)
+    T_lv1 = F.fold(T_lv1_unfold, output_size=(lrsr_lv3.size(2) * 4, lrsr_lv3.size(3) * 4), kernel_size=(12, 12), padding=4, stride=4) / (3. * 3.)
+
+    S = R_lv3_star.view(R_lv3_star.size(0), 1, lrsr_lv3.size(2), lrsr_lv3.size(3))
+
     sr = model.MainNet(lr_t, S, T_lv3, T_lv2, T_lv1)
     if device == 'cuda':
       torch.cuda.synchronize()
