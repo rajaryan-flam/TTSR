@@ -70,6 +70,10 @@ net_sd = model.state_dict()
 net_sd.update(load_net)
 model.load_state_dict(net_sd)
 model.eval()
+# LTE_copy is a second full VGG19-slice copy TTSR.forward() only uses for the
+# training-time perceptual loss (model/TTSR.py's `sr is not None` branch,
+# never hit here) -- drop it to free that VRAM for other use (e.g. batching).
+del model.LTE_copy
 model_load_time = timeit.default_timer() - t0
 
 print('{} LOADED'.format(param.model))
