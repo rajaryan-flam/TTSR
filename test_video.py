@@ -52,12 +52,14 @@ save_dir = os.path.dirname(param.save_path)
 if save_dir:
   os.makedirs(save_dir, exist_ok=True)
 
+t0 = timeit.default_timer()
 model = TTSR.TTSR(base_args).to(device)
 load_net = torch.load(param.model, map_location=device)
 net_sd = model.state_dict()
 net_sd.update(load_net)
 model.load_state_dict(net_sd)
 model.eval()
+model_load_time = timeit.default_timer() - t0
 
 print('{} LOADED'.format(param.model))
 
@@ -74,6 +76,7 @@ def tensor_to_uint8(t):
 
 
 # Load the low-res video
+t0 = timeit.default_timer()
 cap = cv2.VideoCapture(param.lr_video)
 if not cap.isOpened():
   raise RuntimeError("Cannot open video: {}".format(param.lr_video))
@@ -89,6 +92,7 @@ while True:
     break
   lr_frames_bgr.append(frame)
 cap.release()
+video_load_time = timeit.default_timer() - t0
 
 total_frames = len(lr_frames_bgr)
 if total_frames > 0:
@@ -108,6 +112,7 @@ if lr_ratio < 1.0:
 # then mod-crop to a multiple of `scale`. Unlike ERVSR/C2-Matching, TTSR's
 # texture search is resolution-independent between lr and ref, so the ref
 # does NOT need to match the LR frame's (upscaled) size.
+t0 = timeit.default_timer()
 ref_pil = Image.open(param.ref_img).convert('RGB')
 ref_w0, ref_h0 = ref_pil.size
 ref_ratio = min(1.0, max_ref_dim / max(ref_h0, ref_w0))
@@ -128,14 +133,18 @@ ref_sr = np.array(ref_sr_pil.resize((ref_w, ref_h), Image.BICUBIC))
 
 ref_t = to_tensor(ref)
 ref_sr_t = to_tensor(ref_sr)
+ref_prep_time = timeit.default_timer() - t0
 
 print('TEST START\n')
 
 writer = None
+preprocess_time_total = 0.0
 model_time_total = 0.0
+write_time_total = 0.0
 with torch.no_grad():
   start_t = timeit.default_timer()
   for i, frame_bgr in enumerate(lr_frames_bgr):
+    pre_start = timeit.default_timer()
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     if (frame_rgb.shape[1], frame_rgb.shape[0]) != (lr_w, lr_h):
       frame_rgb = cv2.resize(frame_rgb, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
@@ -143,15 +152,17 @@ with torch.no_grad():
 
     lr_t = to_tensor(frame_rgb)
     lr_sr_t = to_tensor(lr_sr)
-
     if device == 'cuda':
       torch.cuda.synchronize()
+    preprocess_time_total += timeit.default_timer() - pre_start
+
     model_start = timeit.default_timer()
     sr, _, _, _, _ = model(lr=lr_t, lrsr=lr_sr_t, ref=ref_t, refsr=ref_sr_t)
     if device == 'cuda':
       torch.cuda.synchronize()
     model_time_total += timeit.default_timer() - model_start
 
+    write_start = timeit.default_timer()
     sr_frame = tensor_to_uint8(sr)
     sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
 
@@ -161,13 +172,28 @@ with torch.no_grad():
       writer = cv2.VideoWriter(param.save_path, fourcc, fps, (out_w, out_h))
 
     writer.write(sr_frame_bgr)
+    write_time_total += timeit.default_timer() - write_start
 
     if (i + 1) % 10 == 0 or i == total_frames - 1:
       elapsed = timeit.default_timer() - start_t
       print('[TEST] {}/{} frames  {:5.2f}s'.format(i + 1, total_frames, elapsed))
 
 writer.release()
+loop_time_total = timeit.default_timer() - start_t
+other_loop_time = loop_time_total - preprocess_time_total - model_time_total - write_time_total
+total_time = model_load_time + video_load_time + ref_prep_time + loop_time_total
 model_fps = total_frames / model_time_total if model_time_total > 0 else float('nan')
-print('\nModel-only forward pass: {:.3f}s total, {:.2f} FPS ({} frames)'.format(
-    model_time_total, model_fps, total_frames))
+pipeline_fps = total_frames / loop_time_total if loop_time_total > 0 else float('nan')
+
+print('\n===== TIMING BREAKDOWN ({} frames) ====='.format(total_frames))
+print('Model load:        {:7.3f}s'.format(model_load_time))
+print('Video load:        {:7.3f}s'.format(video_load_time))
+print('Ref image prep:    {:7.3f}s'.format(ref_prep_time))
+print('Frame preprocess:  {:7.3f}s  ({:.2f} FPS)'.format(preprocess_time_total, total_frames / preprocess_time_total if preprocess_time_total > 0 else float('nan')))
+print('Model inference:   {:7.3f}s  ({:.2f} FPS)'.format(model_time_total, model_fps))
+print('Frame write:       {:7.3f}s  ({:.2f} FPS)'.format(write_time_total, total_frames / write_time_total if write_time_total > 0 else float('nan')))
+print('Other (loop/misc): {:7.3f}s'.format(other_loop_time))
+print('-----')
+print('Per-frame loop total: {:7.3f}s  ({:.2f} FPS end-to-end)'.format(loop_time_total, pipeline_fps))
+print('Grand total runtime:  {:7.3f}s'.format(total_time))
 print('SAVED SR VIDEO TO: {}'.format(param.save_path))
