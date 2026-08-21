@@ -133,6 +133,13 @@ ref_sr = np.array(ref_sr_pil.resize((ref_w, ref_h), Image.BICUBIC))
 
 ref_t = to_tensor(ref)
 ref_sr_t = to_tensor(ref_sr)
+
+# ref/ref_sr are the same on every frame, but TTSR.forward() recomputes their
+# LTE (VGG19) features from scratch on every call. Run LTE on them once here
+# and reuse the result for the whole video instead of paying for it per frame.
+with torch.no_grad():
+  ref_lv1, ref_lv2, ref_lv3 = model.LTE((ref_t.detach() + 1.) / 2.)
+  _, _, refsr_lv3 = model.LTE((ref_sr_t.detach() + 1.) / 2.)
 ref_prep_time = timeit.default_timer() - t0
 
 print('TEST START\n')
@@ -157,7 +164,9 @@ with torch.no_grad():
     preprocess_time_total += timeit.default_timer() - pre_start
 
     model_start = timeit.default_timer()
-    sr, _, _, _, _ = model(lr=lr_t, lrsr=lr_sr_t, ref=ref_t, refsr=ref_sr_t)
+    _, _, lrsr_lv3 = model.LTE((lr_sr_t.detach() + 1.) / 2.)
+    S, T_lv3, T_lv2, T_lv1 = model.SearchTransfer(lrsr_lv3, refsr_lv3, ref_lv1, ref_lv2, ref_lv3)
+    sr = model.MainNet(lr_t, S, T_lv3, T_lv2, T_lv1)
     if device == 'cuda':
       torch.cuda.synchronize()
     model_time_total += timeit.default_timer() - model_start
