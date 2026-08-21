@@ -40,6 +40,16 @@ param = parser.parse_args()
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 scale = 4  # fixed by the pretrained checkpoint's network structure
 
+if device == 'cuda':
+  # Every frame in the video is resized to the same (lr_w, lr_h), so cuDNN's
+  # per-shape algorithm search (benchmark mode) only pays its one-time cost
+  # on the first frame and then reuses the fastest kernels for the rest.
+  # TF32 is left disabled: it truncates matmul/conv mantissa precision, and
+  # this model's hard-argmax texture search (SearchTransfer.bis) is sensitive
+  # enough to that rounding noise to occasionally pick a different reference
+  # patch, producing a visible (if not incorrect) output drift.
+  torch.backends.cudnn.benchmark = True
+
 # TTSR's texture search does a DENSE correlation between every LR patch and
 # every ref patch (at 1/4 resolution): cost/memory scale with
 # (lr_h/4 * lr_w/4) * (ref_h/4 * ref_w/4). At native size (512px LR, ~1000px
