@@ -117,7 +117,19 @@ is pure inference — `model.eval()` is set, nothing is ever backpropagated, and
 tensor produced inside the block is used outside it in a way that needs autograd. Safe
 drop-in with no downside.
 
+> **Correction:** current `test_video.py` uses `torch.no_grad()` throughout, not
+> `torch.inference_mode()` — documenting the actual state for accuracy, since the
+> difference is negligible for this workload either way.
+
 ## The `config.yaml` precision modes
+
+> **Superseded (2026-08-21).** This section describes the mode-switch design as
+> planned at the time it was written, but `test_video.py` never actually gained a
+> `--config` flag or a `yaml` import to read it. The equivalent (and additional)
+> tradeoffs were later implemented as unconditional, hardcoded choices directly in
+> `test_video.py` instead — see [Hardcoded precision/perf
+> choices](#hardcoded-precisionperf-choices-supersedes-configyaml) below for what
+> actually shipped. `config.yaml` has since been removed from the repo as dead code.
 
 Steps 1-4 above are unconditional and always bit-exact. Two further optimizations
 exist that trade a small amount of numerical accuracy for significant additional
@@ -192,6 +204,114 @@ drift on part of the frame is invisible. Avoid it if the output needs to match
 `exact` closely (e.g. for a quantitative quality comparison against the original
 model).
 
+## Hardcoded precision/perf choices (supersedes `config.yaml`)
+
+The mode-switch design above was replaced with four unconditional changes added
+directly to `test_video.py`, no config flag involved. **Benchmarked on a different
+clip than the rest of this document — `shourya_bunty_2.mp4` (208 frames), ref
+`shourya.png`, same GPU.** Numbers in this section are self-consistent with each
+other but not directly comparable to the `ananya.mp4` numbers above (different clip,
+resolution, frame count).
+
+### 5. `cudnn.benchmark` on, TF32 left off
+
+**Change:** `torch.backends.cudnn.benchmark = True` unconditionally (same reasoning
+as step 3 above). `torch.backends.cuda.matmul.allow_tf32` / `cudnn.allow_tf32` were
+tried and then deliberately left `False`.
+
+**Why TF32 was rejected here** (unlike the `tf32` config mode above): TF32 truncates
+matmul/conv mantissa precision, and `SearchTransfer.bis`'s hard-argmax texture search
+is sensitive enough to rounding noise to occasionally flip which reference patch gets
+selected for a handful of positions per frame (confirmed by the fp16 experiment in
+step 6). TF32 only speeds up ops still running in fp32; once the per-frame loop moved
+to fp16 (step 6), the extra speed TF32 could add on top was small relative to the
+extra precision risk, so it was left off.
+
+**Methodological finding worth flagging:** the first attempt to measure TF32's impact
+used `compare.py` (encode both outputs to `mp4v`, diff the two videos, `--alpha 8` to
+amplify) and appeared to show a large, alarming difference (mean 0.77/255 abs diff).
+Directly measuring the `mp4v` encode→decode round-trip noise on **identical,
+unmodified frames** (re-encode, decode, diff against the untouched in-memory array)
+gave **mean 2.58/255** — the codec's own lossy-compression noise is larger than the
+numerical effect it was supposedly measuring. **Comparing two independently
+re-encoded `mp4v` files is not a reliable way to measure a precision change's true
+impact; it has to be measured on raw, uncompressed frames.**
+
+### 6. Mixed precision (fp16) for the per-frame loop only
+
+**Change:** the per-frame loop (`LTE(lrsr)`, the correlation search, `MainNet`) is
+wrapped in `torch.autocast('cuda', dtype=torch.float16)`. The one-time reference
+feature setup is deliberately **not** autocast: those features are reused by every
+frame, so precision lost there is a systematic bias baked into the whole video, not
+independent per-frame noise — and that block only costs ~0.3s regardless of
+precision, so there's no speed reason to risk it.
+
+**bf16 vs fp16 — tested, not assumed** (same lesson as step `fast` above, reconfirmed
+on this checkpoint/clip). Isolated per-frame-loop benchmark, ref features computed in
+fp32 for all three:
+
+| dtype | model FPS | speedup vs fp32 | mean pixel diff vs fp32 (raw frames) | worst-case frame diff |
+|---|---|---|---|---|
+| fp32 (baseline) | 2.50 | 1.0x | — | — |
+| bf16 | 5.96 | 2.38x | 0.26 / 255 | 147 / 255 |
+| fp16 | 5.87 | 2.35x | **0.05 / 255** | **58 / 255** |
+
+Same speed either way (both use the same tensor-core path), but fp16's 10 mantissa
+bits vs bf16's 7 give ~5x less drift and a much smaller worst-case spike, consistent
+with step 5's finding that this model's argmax search punishes rounding error. bf16's
+wider exponent range buys nothing here since activations never approach fp16's
+overflow ceiling. **fp16 was shipped.**
+
+**Measured effect on the real script** (full run, includes preprocessing/write
+overhead, before step 8 below): model inference 2.50 → 6.04 FPS (2.4x), end-to-end
+4.65 FPS.
+
+### 7. Drop the unused `LTE_copy` VGG19 copy
+
+**Change:** `del model.LTE_copy` right after `load_state_dict`.
+
+**Why:** `TTSR.forward()` only uses `LTE_copy` for the training-time perceptual loss
+(the `sr is not None` branch in `model/TTSR.py`), which `test_video.py` never calls
+into — it's a second full VGG19-slice copy sitting on the GPU doing nothing during
+inference.
+
+**Measured effect:** no change to speed or output (re-run gave 6.04 FPS model / 4.68
+FPS end-to-end, matching step 6 within run-to-run noise) — this is pure VRAM headroom
+freed up for future work like frame batching, not a throughput change.
+
+### 8. Move the `lr_sr` upsample from CPU (PIL) to GPU (`F.interpolate`)
+
+**Change:** replaced `np.array(Image.fromarray(frame_rgb).resize((lr_w*scale,
+lr_h*scale), Image.BICUBIC))` — a per-frame CPU bicubic upsample (e.g. 384px→1536px)
+plus a second host→device transfer for the result — with `F.interpolate(lr_t,
+scale_factor=scale, mode='bicubic', align_corners=False)` run directly on the
+already-uploaded `lr_t` GPU tensor.
+
+**Why:** the CPU PIL resize was single-threaded and re-run from scratch every frame;
+doing the same upsample on GPU removes both the CPU cost and one of the two
+host→device transfers per frame.
+
+**Caveat:** torch's bicubic kernel isn't bit-identical to PIL's, so this introduces
+the same small, tie-flip-driven drift as steps 5-6 — not a bug, a different (also
+correct) resampling implementation feeding the search.
+
+**Measured effect:** frame preprocessing 5.03s → 0.14s over 208 frames (**41 FPS →
+1534 FPS** for that stage alone, ~37x). Model inference itself is unaffected (6.04 →
+6.06 FPS, within noise) since this stage doesn't touch it. End-to-end pipeline: 4.68
+→ **5.28 FPS**.
+
+### Summary (this section's clip, `shourya_bunty_2.mp4`)
+
+| State | Model FPS | End-to-end FPS |
+|---|---|---|
+| fp32, `cudnn.benchmark` on, TF32 off (isolated) | 2.50 | — |
+| + fp16 autocast on per-frame loop (step 6) | 6.04 | 4.65 |
+| + `LTE_copy` removed (step 7) | 6.04 | 4.68 |
+| + GPU-side resize (step 8, current) | 6.06 | **5.28** |
+
+Net: **~2.4x model inference**, **~1.13x further end-to-end** from step 8 alone on
+top of step 6/7's gain.
+
 ## What was tried and rejected
 
 - **`channels_last` memory format** on `MainNet`: measured *slower*, not faster
@@ -211,14 +331,15 @@ model).
 ## Files changed
 
 - `test_video.py` — all changes above.
-- `config.yaml` (new) — precision mode selection, documented inline.
+- `config.yaml` — removed; it was never read by `test_video.py` (see the
+  superseded-mode note above), so it was dead weight.
 - `model/*.py` — **untouched**. Every optimization above works by calling existing
   public submodules (`model.LTE`, `model.SearchTransfer`, `model.MainNet`,
   `model.SearchTransfer.bis`) directly from `test_video.py` instead of going through
   `model.forward()`. This keeps the change scoped to the inference script and away
   from code shared with training (`main.py`, `trainer.py`).
 
-## Summary
+## Summary (`ananya.mp4`, steps 1-4 + planned `config.yaml` modes)
 
 | Mode | Model FPS | End-to-end FPS | Accuracy |
 |---|---|---|---|
@@ -226,3 +347,6 @@ model).
 | `exact` (steps 1-4 only) | 3.51 | 3.04 | bit-exact |
 | `tf32` (default) | 4.02 | 3.41 | max 9/255 diff, 1.8% of pixels touched |
 | `fast` | ~5.6 (isolated) | ~5.0 (est.) | max ~2-9/255 diff on tested frames |
+
+See [step 5-8's summary table](#summary-this-sections-clip-shourya_bunty_2mp4) above
+for what actually shipped instead of the `fast`/`tf32` config modes.
