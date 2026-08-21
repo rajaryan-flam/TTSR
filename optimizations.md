@@ -388,6 +388,113 @@ regression's actual cause is `MainNet` interleaving convs with `PixelShuffle`
 and `F.interpolate(bicubic)` (neither has an NHWC-optimized fast path), not the
 dtype. Not applied.
 
+### 12. Compile the whole per-frame function, not just `MainNet`/`LTE` individually
+
+**Change:** instead of wrapping `model.MainNet` and `model.LTE` in
+`torch.compile` separately (step 10), `run_frame_model()` itself — the
+function containing the `LTE` call, the `unfold`/`normalize`/`bmm`/`max`
+search, the 3x `SearchTransfer.bis` gather + `F.fold` transfer, and the
+`MainNet` call — is compiled as one unit:
+`run_frame_model = torch.compile(run_frame_model, mode="reduce-overhead")`.
+
+**Why:** profiling step 10's compiled pipeline stage-by-stage (208 frames)
+showed the search+transfer glue between the two compiled submodules — plain
+eager `F.unfold`/`F.normalize`/`torch.bmm`/`torch.max`/`SearchTransfer.bis`'s
+`torch.gather`/`F.fold` — was costing **~48.8ms/frame (50.5% of total)** on
+its own, more than `MainNet` itself:
+
+| Stage | ms/frame | % of total |
+|---|---|---|
+| `LTE` (compiled) | 3.9 | 4.0% |
+| search (eager) | 17.4 | 18.0% |
+| transfer (eager) | 31.4 | 32.5% |
+| `MainNet` (compiled) | 43.8 | 45.4% |
+
+Compiling `MainNet`/`LTE` individually left three separate "islands" with
+Python dispatch gaps between them — `reduce-overhead`'s CUDA-graph capture only
+covers what's inside each `torch.compile` call, not the eager code stitching
+them together. Compiling the whole function lets Inductor fuse the
+search/transfer glue's many small ops together with `LTE`/`MainNet` into one
+CUDA graph spanning the entire frame.
+
+**Verified:** compared against step 10's per-frame output on the same
+208-frame clip (raw in-memory frames, not re-encoded video, per this
+document's own mp4v-noise finding). `R_lv3_star_arg` matches on 99.9% of
+positions; where it differs (0.097% of pixels) it's the same class of argmax
+tie-flip already accepted for TF32/batching elsewhere in this document — mean
+pixel drift **0.008/255**, far under the ~2.58/255 mp4v codec noise floor. Not
+bit-exact like step 10 was (fusing `LTE`'s convs into a larger graph changes
+Inductor's kernel selection for them), but the same "noise, not a bug"
+category, not a correctness regression.
+
+**Measured effect:** model inference 96.5ms/frame (10.37 FPS) →
+**75.8ms/frame (13.20 FPS)**, real script end-to-end 8.36 → **9.92 FPS**.
+`torch.compile`'s `max-autotune` mode was also tried on top of this (a more
+exhaustive Triton kernel search) — only 73.5ms/frame (a further 2.6%) for
+~4x the warm-up cost (83s vs 20s); not worth it, `reduce-overhead` stays the
+default.
+
+**Ceiling found:** re-tested batching (see the dedicated section below) under
+this full-graph compile — batch_size=4 gave 76.9ms/frame, no better than
+batch_size=1. Combined with the stage profile above, this confirms the
+remaining time is genuine memory/compute-bound work (`T_lv1` alone is
+~302MB/frame at fp16) rather than launch overhead or batch-parallelism
+headroom — pushing meaningfully past this floor needs an algorithmic or
+precision change (lower `max_lr_dim`, fp8, or restructuring the texture
+search), each carrying the same accuracy-revalidation cost as the
+bicubic/TF32 decisions elsewhere in this document, not a free compiler knob.
+
+**Considered and rejected: pushing model inference below ~76ms/frame.**
+Requested target was 35ms/frame. `MainNet`'s own compiled compute alone is
+~43.8ms — already above that target by itself, before `LTE`/search/transfer
+are even counted — so no further compiler/fusion trick can reach 35ms; it
+would require cutting `MainNet`'s actual arithmetic, via fp8 precision (this
+GPU has native fp8 tensor cores, but fp8's much smaller dynamic range needs
+per-layer calibration and real accuracy validation against this model's
+argmax-sensitive search) or a lower `max_lr_dim` (directly shrinks the
+delivered output resolution). Both are genuine accuracy/quality tradeoffs, not
+hidden optimizations like everything else in this document — decided to keep
+the ~76ms lossless result instead of pursuing either.
+
+### 13. Overlap frame writing with the next frame's GPU work
+
+**Change:** `test_video.py`'s main loop no longer calls
+`torch.cuda.synchronize()` after preprocessing and after the model, and no
+longer calls `cv2.VideoWriter.write()` inline. Per-frame preprocess/model GPU
+time is now measured with `torch.cuda.Event(enable_timing=True)` pairs
+(recorded without blocking, queried once at the end after a single final
+sync) instead of a blocking sync per stage. The mp4v encode+write moves to a
+dedicated background thread fed by a bounded `queue.Queue` (maxsize=4, single
+consumer so frame order is preserved via plain FIFO) — the main thread hands
+off a frame and immediately moves on to the next frame's preprocessing/model
+call instead of blocking on the synchronous OpenCV encode. `tensor_to_uint8`
+was also replaced with `tensor_to_uint8_bgr`, which does the `round()`→
+`uint8` cast and the RGB→BGR channel swap on GPU *before* the device→host
+copy (bit-exact either way — `clamp()`+`round()` already guarantee integer
+values in range — but halves the transfer size and removes a `cv2.cvtColor`
+CPU pass).
+
+**Why safe to overlap:** the one thing that must stay synchronous is the
+device→host copy inside `tensor_to_uint8_bgr` — `reduce-overhead`'s CUDA-graph
+capture (step 12) reuses the same static output buffer on every call to
+`run_frame_model`, so a frame's data has to be safely copied out to a CPU
+numpy array before the *next* call overwrites that buffer. That copy is cheap
+(~7MB) relative to model inference (~76ms), so requiring it to complete before
+moving on costs almost nothing — only the slow part (the actual mp4v encode)
+moves to the background thread.
+
+**Verified:** raw pixel diff against step 12's output (same 208-frame clip):
+mean **0.004/255**, max **0.06/255** — smaller than ordinary
+`cudnn.benchmark` run-to-run kernel-selection noise, not a logic change (the
+GPU-side cast/swap is bit-exact; threading only changes *when* a frame is
+written, not its contents or order — frame count matched exactly, 208/208).
+
+**Measured effect:** end-to-end 9.92 → **12.95 FPS** (real script, on top of
+step 12) — writer-thread busy time (2.78s/208 frames = 13.4ms/frame) is now
+almost entirely hidden behind the next frame's ~76ms of GPU work, closing
+nearly all of the previous gap between model-only FPS (13.17) and end-to-end
+FPS.
+
 ### Summary (this section's clip, `shourya_bunty_2.mp4`)
 
 | State | Model FPS | End-to-end FPS |
@@ -397,11 +504,70 @@ dtype. Not applied.
 | + `LTE_copy` removed (step 7) | 6.04 | 4.68 |
 | + GPU-side resize (step 8) | 6.06 | 5.28 |
 | + fp16 ref-unfold storage (step 9) | 6.32 | 5.48 |
-| + `torch.compile` reduce-overhead (step 10, current) | **10.37** | **8.36** |
+| + `torch.compile` reduce-overhead, `MainNet`/`LTE` only (step 10) | 10.37 | 8.36 |
+| + full-function `torch.compile` (step 12) | 13.20 | 9.92 |
+| + threaded frame write (step 13, current) | **13.17*** | **12.95** |
 
-Net across steps 6-10: **~4.1x model inference**, **~1.79x end-to-end** on top
+\* Model FPS is expected to be statistically the same as step 12 (13.17 vs.
+13.20 is run-to-run `cudnn.benchmark` noise) — step 13 doesn't touch model
+compute at all, it only removes serialization between model compute and I/O.
+
+Net across steps 6-13: **~5.3x model inference**, **~2.78x end-to-end** on top
 of whatever steps 1-4 already bought on `ananya.mp4`. `channels_last` (step 11)
 tested and rejected again, no change.
+
+## Batching and multi-frame throughput (previously deferred)
+
+Batching and TensorRT were deferred in earlier passes (see "What was tried
+and rejected" below); both were later implemented and measured in
+`test_video_batched.py` and `convert_tensorrt.py`.
+
+**Batching (`test_video_batched.py`):** `SearchTransfer`'s correlation and
+`MainNet`'s convs were made batch-aware — `torch.bmm` → `torch.matmul` (which
+broadcasts the batch dim; `bmm` requires an exact match) so the batch-of-1
+ref-side tensors broadcast against a batch-of-B lrsr tensor, and
+`ref_lv1/2/3_unfold` are `.expand()`-ed from batch-1 to batch-B (a view, not a
+copy) before `SearchTransfer.bis`'s `torch.gather`. Verified correct: batched
+vs per-frame output mean abs pixel diff 0.0048/255, max 0.47/255 (the same
+class of kernel-selection tie-flip noise as everywhere else in this document,
+not a bug). **Measured effect: negligible.** At `batch_size=4` with
+`torch.compile` already applied to `MainNet`/`LTE` individually (step 10):
+10.19 FPS vs. 10.37 FPS at `batch_size=1` — batching brought basically nothing,
+because `torch.compile` had already removed the kernel-launch overhead
+batching would otherwise amortize. Re-tested again after step 12's full-graph
+compile: still no improvement (76.9 vs 75.8 ms/frame) — see step 12's "ceiling
+found" note. This confirms the original prediction below ("compute and memory
+both scale linearly with batch size, for no reduction in total FLOPs") was
+correct; batching is implemented and available but isn't a speed lever once
+`torch.compile` is in place.
+
+**TensorRT (`convert_tensorrt.py`):** `LTE` and `MainNet` exported to ONNX
+(true fp16 weights/activations, `dynamo=False`) and built as separate
+`STRONGLY_TYPED` TensorRT engines (TensorRT 10+ removed the old
+implicit-batch/`BuilderFlag.FP16` APIs this originally targeted). `LTE`'s
+engine is fast and roughly matches compiled eager (3.3ms/call vs. 3.9ms).
+**`MainNet`'s engine is not a win — it measured 440ms/call, ~10x slower than
+the 43.8ms compiled-eager stage time.** Root cause, confirmed by a controlled
+test: `MainNet.py` calls `F.interpolate(mode='bicubic')` about 8 times
+(`CSFI2`, `CSFI3`, `MergeTail`, and twice directly on `S`), interleaved with
+convs throughout the network. TensorRT's ONNX-imported `Resize` op has no fast
+native kernel for cubic mode, so its Myelin backend synthesizes a slow generic
+fallback — and because the resizes are interleaved with everything else,
+Myelin fuses the *entire* network around that fallback into one opaque kernel
+(this is also why the engine build itself needed a real, fixed ~51GB
+workspace just to compile — see the comments in `convert_tensorrt.py`).
+Patching every `bicubic` call to `bilinear` before export (diagnostic only,
+not shipped) dropped `MainNet`'s engine to 30.4ms/call — 14.5x faster,
+finally beating compiled eager — but `bilinear` vs `bicubic` is a genuine
+model-output change (the checkpoint was trained against bicubic upsampling),
+carrying the same accuracy-revalidation requirement as the `channels_last`/
+TF32 decisions elsewhere in this document. Not applied. **Conclusion:**
+PyTorch's native bicubic kernel (used by both eager and `torch.compile`) has
+no such penalty, so for this architecture `torch.compile`'s full-graph fusion
+(step 12) beats TensorRT outright — TensorRT is not currently used by either
+inference script for `MainNet`. `test_video_batched.py` still loads and runs
+both engines (so the conversion + wrapper code is exercised and correct), but
+the eager/compiled path in `test_video.py` remains the faster option.
 
 ## What was tried and rejected
 
@@ -410,18 +576,29 @@ tested and rejected again, no change.
   `PixelShuffle` upsampling and bicubic interpolation in a way that doesn't benefit
   from the NHWC layout on this GPU/cuDNN version — likely the per-call layout
   conversion cost outweighs any conv speedup. Not used.
-- **Batching multiple frames per forward call**: rejected without implementing.
-  `SearchTransfer`'s correlation and `MainNet`'s convs both do zero cross-frame
-  work-sharing — only the ref-side features (already cached in steps 1-2) are shared
-  across frames — so compute and memory both scale linearly with batch size, for no
-  reduction in total FLOPs. The only theoretical benefit is amortizing kernel-launch
-  overhead, and profiling showed that overhead is negligible on this GPU relative to
-  per-op compute time (each frame's ~150 small conv calls take a few milliseconds of
-  launch overhead against ~285ms of actual compute). Poor risk/reward; not implemented.
+- **Batching multiple frames per forward call**: originally deferred on this
+  reasoning (`SearchTransfer`'s correlation and `MainNet`'s convs both do zero
+  cross-frame work-sharing, so compute/memory scale linearly with batch size —
+  the only theoretical benefit is amortizing kernel-launch overhead). Later
+  implemented (`test_video_batched.py`) and measured: confirmed correct, but
+  confirmed *not* a speed win once `torch.compile` is in place — see the
+  "Batching and multi-frame throughput" section above for numbers.
+- **TensorRT for `MainNet`**: implemented (`convert_tensorrt.py`), builds and
+  passes its correctness smoke test, but measured ~10x *slower* than compiled
+  eager (440ms vs 43.8ms/call) because TensorRT has no efficient kernel for
+  this network's `bicubic` resizes — see the "Batching and multi-frame
+  throughput" section above. Not used by either inference script for `MainNet`.
 
 ## Files changed
 
-- `test_video.py` — all changes above.
+- `test_video.py` — all changes above (steps 1-13).
+- `test_video_batched.py` — batched variant of `test_video.py` (see "Batching
+  and multi-frame throughput" above); also the consumer of the TensorRT
+  engines built by `convert_tensorrt.py` (loads `LTE`/`MainNet` `.engine`
+  files instead of `TTSR.pt`'s eager submodules, with the `MainNet` slowness
+  caveat noted above still applying to that path).
+- `convert_tensorrt.py` — exports `LTE`/`MainNet` to ONNX and builds TensorRT
+  `.engine` files; not currently used by `test_video.py` (see above).
 - `config.yaml` — removed; it was never read by `test_video.py` (see the
   superseded-mode note above), so it was dead weight.
 - `model/*.py` — **untouched**. Every optimization above works by calling existing

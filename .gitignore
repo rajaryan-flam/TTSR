@@ -1,2 +1,5 @@
 *__pycache__*
 *.pt
+trt_engines/
+*.engine
+*.onnx

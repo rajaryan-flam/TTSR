@@ -6,6 +6,8 @@ import argparse
 import sys
 import timeit
 import cv2
+import queue
+import threading
 import torch.nn.functional as F
 from PIL import Image
 
@@ -84,10 +86,20 @@ def to_tensor(img_uint8):
   return torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))).unsqueeze(0).float().to(device, non_blocking=True)
 
 
-def tensor_to_uint8(t):
+def tensor_to_uint8_bgr(t):
+  # t: [1,3,H,W] fp16, RGB order, values in [-1,1].
+  # Cast to uint8 and swap to BGR order BEFORE the device->host copy, not
+  # after: casting first halves the transfer (1 byte/pixel vs 2 for fp16),
+  # and the channel swap is then just GPU index reordering instead of a
+  # cv2.cvtColor CPU pass. Both are bit-exact vs. doing them on the CPU
+  # afterwards -- round()+clamp() already guarantee the fp16 values are
+  # integers in [0,255], so casting to uint8 (here or on the host) is exact,
+  # and reordering channels doesn't touch the values at all.
   img = (t + 1.) * 127.5
-  img = img.squeeze(0).clamp(0, 255).round().cpu().numpy()
-  return np.transpose(img, (1, 2, 0)).astype(np.uint8)
+  img = img.clamp(0, 255).round().to(torch.uint8)
+  img = img[:, [2, 1, 0], :, :]  # RGB -> BGR
+  img = img.squeeze(0).cpu().numpy()
+  return np.transpose(img, (1, 2, 0))  # HWC, uint8, BGR -- ready for cv2.VideoWriter
 
 
 # Load the low-res video
@@ -211,16 +223,27 @@ def run_frame_model(lr_t, lr_sr_t):
 
 compile_warmup_time = 0.0
 if device == 'cuda':
-  # MainNet makes ~150 small conv calls/frame with a static shape for the
-  # whole video (same precondition cudnn.benchmark already exploits) and no
-  # data-dependent branching -- reduce-overhead mode captures this as a CUDA
-  # graph, cutting Python/kernel-launch overhead across those calls. Verified
-  # bit-identical output vs uncompiled (0.0 pixel diff, exact argmax match)
-  # on a full 208-frame test -- this is graph capture/fusion, not a precision
-  # change, unlike the fp16/TF32 decisions elsewhere in this script.
+  # Compile the WHOLE per-frame function -- LTE, the unfold/normalize/bmm/max
+  # search, the 3x gather+fold transfer, and MainNet -- as one graph, instead
+  # of compiling model.MainNet/model.LTE individually. Profiling showed the
+  # search+transfer glue between those two submodules (plain eager PyTorch)
+  # was costing ~48ms/frame on its own -- half the per-frame budget -- almost
+  # none of which was actual GPU idle time savable by more compute, but rather
+  # Python dispatch/launch overhead between many small unfold/gather/fold/bmm
+  # calls that a submodule-only compile couldn't see across. Folding all of it
+  # into one reduce-overhead-compiled function (one CUDA graph covering the
+  # entire frame) cut measured model inference from 96.5ms/frame (10.37 FPS)
+  # to 75.8ms/frame (13.20 FPS) on the 208-frame benchmark clip -- a ~27%
+  # additional win with no further precision change (fp16 autocast is
+  # unchanged). This does put LTE's convs in the same fused graph as the
+  # search/transfer glue, so Inductor can pick different fused kernels for
+  # them than compiling LTE alone did -- verified this only produces the same
+  # class of tiny argmax tie-flip drift already accepted for TF32/batching
+  # elsewhere in this session (0.097% of pixels flip patch, mean drift
+  # 0.008/255, far under the ~2.58/255 mp4v re-encode noise floor), not a
+  # correctness regression.
   t0 = timeit.default_timer()
-  model.MainNet = torch.compile(model.MainNet, mode='reduce-overhead')
-  model.LTE = torch.compile(model.LTE, mode='reduce-overhead')
+  run_frame_model = torch.compile(run_frame_model, mode='reduce-overhead')
   # Warm up on the first real frame's data so compilation (and reduce-overhead's
   # CUDA graph capture, which needs a few real calls to lock in) happens here,
   # not inside frame 0's timed model_time_total. Cold: ~20s (one-time Inductor
@@ -242,9 +265,49 @@ if device == 'cuda':
 print('TEST START\n')
 
 writer = None
-preprocess_time_total = 0.0
-model_time_total = 0.0
 write_time_total = 0.0
+# Frame encode+write runs on a dedicated background thread fed by a bounded
+# queue, so the main thread can move straight on to the next frame's GPU work
+# instead of blocking on cv2's synchronous mp4v encode. Single consumer
+# thread (not a pool) preserves frame order via plain FIFO -- no reordering
+# risk. Bounded size (not unbounded) means a main thread that outruns the
+# encoder blocks on `put()` instead of buffering the whole video in RAM; in
+# practice the encoder (~24ms/frame) is faster than model inference
+# (~76ms/frame, see optimizations.md step 12), so the queue should rarely
+# hold more than one frame.
+write_queue = queue.Queue(maxsize=4)
+
+
+def writer_thread_fn():
+  global writer, write_time_total
+  while True:
+    item = write_queue.get()
+    if item is None:
+      write_queue.task_done()
+      break
+    w0 = timeit.default_timer()
+    if writer is None:
+      out_h, out_w = item.shape[:2]
+      fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+      writer = cv2.VideoWriter(param.save_path, fourcc, fps, (out_w, out_h))
+    writer.write(item)
+    write_time_total += timeit.default_timer() - w0
+    write_queue.task_done()
+
+
+writer_thread = threading.Thread(target=writer_thread_fn, daemon=True)
+writer_thread.start()
+
+# Preprocess/model timings used to come from torch.cuda.synchronize() calls
+# bracketing each stage -- accurate, but each one blocks the CPU until the
+# *entire* GPU pipeline drains, which re-serializes every frame regardless of
+# what the write step does and defeats the threaded writer above. CUDA
+# events record timestamps on the stream without blocking the CPU; querying
+# elapsed_time() does block, so query all of them once at the end (after one
+# final synchronize) instead of per frame.
+preprocess_events = []  # (start, end) per frame
+model_events = []       # (end-of-preprocess, end-of-model) per frame
+
 # fp16 over bf16: benchmarked on-device, both give the same ~2.3x speedup,
 # but fp16's extra mantissa bits (10 vs bf16's 7) cut mean pixel drift vs.
 # fp32 by ~5x (0.05 vs 0.26 / 255) -- this model's hard-argmax texture
@@ -254,7 +317,12 @@ write_time_total = 0.0
 with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=(device == 'cuda')):
   start_t = timeit.default_timer()
   for i, frame_bgr in enumerate(lr_frames_bgr):
-    pre_start = timeit.default_timer()
+    if device == 'cuda':
+      e_pre_start = torch.cuda.Event(enable_timing=True)
+      e_pre_end = torch.cuda.Event(enable_timing=True)
+      e_model_end = torch.cuda.Event(enable_timing=True)
+      e_pre_start.record()
+
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     if (frame_rgb.shape[1], frame_rgb.shape[0]) != (lr_w, lr_h):
       frame_rgb = cv2.resize(frame_rgb, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
@@ -264,35 +332,44 @@ with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=(devic
     # to PIL's, so lrsr_lv3 (and the argmax texture search fed by it) shifts
     # by the same small, tie-flip-driven margin as the fp16/TF32 changes did.
     lr_sr_t = F.interpolate(lr_t, scale_factor=scale, mode='bicubic', align_corners=False)
-    if device == 'cuda':
-      torch.cuda.synchronize()
-    preprocess_time_total += timeit.default_timer() - pre_start
 
-    model_start = timeit.default_timer()
+    if device == 'cuda':
+      e_pre_end.record()
+
     sr = run_frame_model(lr_t, lr_sr_t)
+
     if device == 'cuda':
-      torch.cuda.synchronize()
-    model_time_total += timeit.default_timer() - model_start
+      e_model_end.record()
+      preprocess_events.append((e_pre_start, e_pre_end))
+      model_events.append((e_pre_end, e_model_end))
 
-    write_start = timeit.default_timer()
-    sr_frame = tensor_to_uint8(sr)
-    sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
-
-    if writer is None:
-      out_h, out_w = sr_frame_bgr.shape[:2]
-      fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-      writer = cv2.VideoWriter(param.save_path, fourcc, fps, (out_w, out_h))
-
-    writer.write(sr_frame_bgr)
-    write_time_total += timeit.default_timer() - write_start
+    # This device->host copy is the one point per frame that must stay
+    # synchronous: it has to happen before the *next* iteration's
+    # run_frame_model call, since reduce-overhead's CUDA-graph capture
+    # reuses the same output buffer on every call, so this frame's data must
+    # be safely copied out before it's overwritten. It's also cheap (a
+    # single ~7MB frame) relative to model inference, so this doesn't
+    # meaningfully block anything -- only the slow mp4v *encode* moves to
+    # the background thread below.
+    sr_frame_bgr = tensor_to_uint8_bgr(sr)
+    write_queue.put(sr_frame_bgr)
 
     if (i + 1) % 10 == 0 or i == total_frames - 1:
       elapsed = timeit.default_timer() - start_t
       print('[TEST] {}/{} frames  {:5.2f}s'.format(i + 1, total_frames, elapsed))
 
+write_queue.put(None)
+writer_thread.join()
 writer.release()
 loop_time_total = timeit.default_timer() - start_t
-other_loop_time = loop_time_total - preprocess_time_total - model_time_total - write_time_total
+
+if device == 'cuda':
+  torch.cuda.synchronize()
+  preprocess_time_total = sum(s.elapsed_time(e) for s, e in preprocess_events) / 1000.0
+  model_time_total = sum(s.elapsed_time(e) for s, e in model_events) / 1000.0
+else:
+  preprocess_time_total = model_time_total = 0.0
+
 total_time = model_load_time + video_load_time + ref_prep_time + compile_warmup_time + loop_time_total
 model_fps = total_frames / model_time_total if model_time_total > 0 else float('nan')
 pipeline_fps = total_frames / loop_time_total if loop_time_total > 0 else float('nan')
@@ -302,10 +379,9 @@ print('Model load:        {:7.3f}s'.format(model_load_time))
 print('Video load:        {:7.3f}s'.format(video_load_time))
 print('Ref image prep:    {:7.3f}s'.format(ref_prep_time))
 print('Compile warmup:    {:7.3f}s'.format(compile_warmup_time))
-print('Frame preprocess:  {:7.3f}s  ({:.2f} FPS)'.format(preprocess_time_total, total_frames / preprocess_time_total if preprocess_time_total > 0 else float('nan')))
-print('Model inference:   {:7.3f}s  ({:.2f} FPS)'.format(model_time_total, model_fps))
-print('Frame write:       {:7.3f}s  ({:.2f} FPS)'.format(write_time_total, total_frames / write_time_total if write_time_total > 0 else float('nan')))
-print('Other (loop/misc): {:7.3f}s'.format(other_loop_time))
+print('Frame preprocess:  {:7.3f}s  ({:.2f} FPS)  [via CUDA events, not a blocking sync]'.format(preprocess_time_total, total_frames / preprocess_time_total if preprocess_time_total > 0 else float('nan')))
+print('Model inference:   {:7.3f}s  ({:.2f} FPS)  [via CUDA events, not a blocking sync]'.format(model_time_total, model_fps))
+print('Frame write:       {:7.3f}s  ({:.2f} FPS)  [writer-thread busy time -- overlaps with the next frame\'s GPU work above, not additive with it]'.format(write_time_total, total_frames / write_time_total if write_time_total > 0 else float('nan')))
 print('-----')
 print('Per-frame loop total: {:7.3f}s  ({:.2f} FPS end-to-end)'.format(loop_time_total, pipeline_fps))
 print('Grand total runtime:  {:7.3f}s'.format(total_time))
