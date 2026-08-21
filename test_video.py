@@ -192,10 +192,12 @@ with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=(devic
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     if (frame_rgb.shape[1], frame_rgb.shape[0]) != (lr_w, lr_h):
       frame_rgb = cv2.resize(frame_rgb, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
-    lr_sr = np.array(Image.fromarray(frame_rgb).resize((lr_w * scale, lr_h * scale), Image.BICUBIC))
-
     lr_t = to_tensor(frame_rgb)
-    lr_sr_t = to_tensor(lr_sr)
+    # GPU bicubic upsample instead of a per-frame CPU PIL resize + a second
+    # host->device transfer. Note: torch's bicubic kernel isn't bit-identical
+    # to PIL's, so lrsr_lv3 (and the argmax texture search fed by it) shifts
+    # by the same small, tie-flip-driven margin as the fp16/TF32 changes did.
+    lr_sr_t = F.interpolate(lr_t, scale_factor=scale, mode='bicubic', align_corners=False)
     if device == 'cuda':
       torch.cuda.synchronize()
     preprocess_time_total += timeit.default_timer() - pre_start
